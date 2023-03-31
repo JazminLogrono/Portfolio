@@ -1,0 +1,745 @@
+---
+title: "IST 707 - Group 2 - Opioid Prescriber Analysis"
+output: html_document
+date: '2022-06-18'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Data Preparation
+
+```{r}
+#load required libraries for initial data preparation (and other pieces of the project)
+suppressPackageStartupMessages({
+library(tidyr)
+library(data.table)
+library(dplyr)
+library(tidyverse)
+library(arules)
+library(readxl)
+library(C50)
+library(gsubfn)
+library(gmodels)
+library(naivebayes)
+library(RWeka)
+library(factoextra)
+library(stringr)
+library(clustertend)
+library(NbClust)
+library(ClusterR)
+library(fpc)
+library(clusterSim)
+library(psych)
+library(FactoMineR)
+library(clustMixType)
+library(FSelector)
+library(kernlab)
+library(e1071)  
+library(caret)  
+  })
+```
+
+The original data sets used for this project can be downloaded from the following websites: 
+Medicare Part D Prescribers - by Provider and Drug:   https://data.cms.gov/provider-summary-by-type-of-service/medicare-part-d-prescribers/medicare-part-d-prescribers-by-provider-and-drug/data
+
+Medicare Part D Prescribers - by Geography and Drug: 
+https://data.cms.gov/provider-summary-by-type-of-service/medicare-part-d-prescribers/medicare-part-d-prescribers-by-geography-and-drug/data
+
+We also referenced code in Kaggle script below for preparing the final data set for further analysis: https://raw.githubusercontent.com/apryor6/apryor6.github.io/master/Identifying-Opioid-Prescribers/create-dataset.R.
+
+First, we needed to combine the two original data sets obtained from cms.gov and created a new data set to be used for our project.
+```{r}
+# read inital data sets
+# read 2019 prescriber data downloaded from cms website provided above
+prescriber <- read.csv('MUP_DPR_RY21_P04_V10_DY19_NPIBN_1.csv')
+# read 2019 drug data downloaded from cms website provided above
+alldrugs <-read.csv('Medicare_Part_D_Prescribers_by_Geography_and_Drug_2019.csv') 
+
+# review the data sets
+str(prescriber)
+str(alldrugs)
+```
+
+```{r}
+#since generic names are most commonly used by prescribers, we will extract generic drug names for future analysis
+drug_names <- prescriber %>%
+  group_by(Gnrc_Name) %>%
+  summarise(occurences = n()) %>%
+  arrange(desc(occurences))
+
+#find out the total number of drugs in the original data set
+tot_num_drugs <- length(drug_names$Gnrc_Name)
+```
+
+```{r}
+#select the top 250 most prescribed drugs for the analyses
+num_drugs <- 250 
+num_drugs <- ifelse(tot_num_drugs <= num_drugs,tot_num_drugs,num_drugs)
+drugs <- as.character(drug_names$Gnrc_Name[1:num_drugs])
+```
+
+```{r}
+#replace slashes, spaces and hyphens in drug names to periods
+drugs <- sort(gsub("/",".",drugs))
+drugs <- sort(gsub(" ",".",drugs))
+drugs <- sort(gsub("-",".",drugs))
+prescriber$Gnrc_Name <- gsub("/",".",prescriber$Gnrc_Name)
+prescriber$Gnrc_Name <- gsub(" ",".",prescriber$Gnrc_Name)
+prescriber$Gnrc_Name <- gsub("-",".",prescriber$Gnrc_Name)
+```
+
+```{r}
+#only consider observations that were prescribed at least one of the drugs in our drug list
+prescriber <- prescriber %>% 
+  filter(Gnrc_Name %in% drugs)
+
+prescriber <- data.frame(prescriber)
+```
+
+Note:The code below takes a few minutes to run.
+```{r}
+#combine the prescriptions for drugs that were repeatedly prescribed by the same prescriber
+prescriber <- prescriber %>%
+  group_by(Prscrbr_NPI,Prscrbr_Last_Org_Name,Prscrbr_First_Name,Gnrc_Name) %>%
+  mutate(Tot_Clms=sum(Tot_Clms,na.rm=TRUE)) %>%
+  filter(!duplicated(Gnrc_Name)) %>%
+  ungroup()
+```
+
+```{r}
+#convert from long to wide format and aggregate rows for each prescriber with the number of prescriptions written for each drug
+
+prescriber_final <- prescriber %>%
+  select(Prscrbr_NPI,Prscrbr_State_Abrvtn,Prscrbr_Type, Gnrc_Name, Tot_Clms) %>%
+  spread(key=Gnrc_Name, value=Tot_Clms,fill=0) %>%
+  select(Prscrbr_NPI,Prscrbr_State_Abrvtn,Prscrbr_Type, one_of(drugs))
+
+```
+
+```{r}
+#check the first seveval rows of the final data set
+head(prescriber_final)
+```
+
+```{r}
+#then we need to find out which drugs in our alldrugs data set are regular opiate drugs
+opiate_drugs <- alldrugs[alldrugs$Opioid_Drug_Flag == "Y",]
+```
+
+```{r}
+#replace slashes, spaces and hyphens in drug names to periods
+opiate_drugs$Gnrc_Name <- gsub("/",".",opiate_drugs$Gnrc_Name)
+opiate_drugs$Gnrc_Name <- gsub(" ",".",opiate_drugs$Gnrc_Name)
+opiate_drugs$Gnrc_Name <- gsub("-",".",opiate_drugs$Gnrc_Name)
+```
+
+```{r}
+#extract the regular opiate drug names and create a vector that only include unique names
+opiate_drugs_list <- opiate_drugs$Gnrc_Name
+opiate_drugs_list <- opiate_drugs_list[!duplicated(opiate_drugs_list)]
+opiate_drugs_list <- toupper(opiate_drugs_list)
+
+```
+
+
+```{r}
+#change all the prescriber_final column names to upper case so they match with the drug lists created above
+names(prescriber_final) <- toupper(names(prescriber_final))
+
+#see which columns from prescriber_final overlap with the opiate_drugs_list and LAopiate_drugs_list
+dfcols <- colnames(prescriber_final)
+
+final_opiate_drugs_list <- intersect(opiate_drugs_list, dfcols)
+#check the final opiate drug list
+final_opiate_drugs_list
+```
+Per result above, our final data set prescriber_final includes 10 opiate drug columns.
+
+```{r}
+#create output variable OPIOD_PRESC - if any drug in the final_opiate_drugs_list was prescribed at least once, then the value of OPIOD_PRESC is TRUE, otherwise the value is FALSE
+prescriber_final$OPIOD_PRESC <- ifelse(prescriber_final$ACETAMINOPHEN.WITH.CODEINE > 0, TRUE,
+                                ifelse(prescriber_final$MORPHINE.SULFATE > 0, TRUE,
+                                ifelse(prescriber_final$HYDROCODONE.ACETAMINOPHEN > 0, TRUE,
+                                ifelse(prescriber_final$TRAMADOL.HCL > 0, TRUE,
+                                ifelse(prescriber_final$HYDROMORPHONE.HCL > 0, TRUE,
+                                ifelse(prescriber_final$METHADONE.HCL > 0, TRUE,
+                                ifelse(prescriber_final$FENTANYL > 0, TRUE,
+                                ifelse(prescriber_final$OXYCODONE.HCL.ACETAMINOPHEN > 0, TRUE,
+                                ifelse(prescriber_final$OXYCODONE.HCL > 0, TRUE,
+                                ifelse(prescriber_final$TOPIRAMATE > 0, TRUE, FALSE))))))))))
+
+
+#check the last column we just created
+last_data <- prescriber_final[ , ncol(prescriber_final), drop = FALSE]
+last_data  
+
+#check the summary of the OPIOD_PRESC variable
+summary(prescriber_final$OPIOD_PRESC)
+```
+
+We saved a copy of the final data set to a csv file.
+
+```{r}
+write.csv(prescriber_final, file="prescriber_2019.csv", row.names=FALSE)
+```
+
+### Exploratory and Descriptive Analysis
+
+```{r}
+# read final prescriber data set created above
+prescriber <- read.csv('prescriber_2019.csv')
+prescriber_final <- prescriber
+str(prescriber_final)
+```
+
+```{r}
+#check if the data set is complete
+nrow(prescriber_final[!complete.cases(prescriber_final),]) #0 means there are no incomplete rows
+```
+
+```{r}
+#convert prescriber NPI to factor
+prescriber_final$PRSCRBR_NPI <- as.factor(prescriber_final$PRSCRBR_NPI)
+
+#convert character variables to factors
+prescriber_final <- prescriber_final %>% 
+  mutate_if(is.character, funs(as.factor))
+
+#convert output variable to factor
+prescriber_final$OPIOD_PRESC <- as.factor(prescriber_final$OPIOD_PRESC)
+```
+
+First, we reviewed how many prescriber types are included in the data set.
+```{r}
+str(prescriber_final$PRSCRBR_TYPE)
+```
+As shown above, the data set includes 183 different prescriber types.
+
+We then checked how many states are included.
+```{r}
+str(prescriber_final$PRSCRBR_STATE_ABRVTN)
+```
+
+The data set includes information for 61 "states", which are 50 United States, District of Columbia, U.S. territories, Armed Forces areas, Unknown and Foreign Country. For our analysis, we will remove the Unknown and Foreign Country records and use information of the remaining 59 "states".
+
+```{r}
+# remove Unknown and Foreign Country records that are belong to states XX and ZZ
+prescriber_final_new<-prescriber_final[!(prescriber_final$PRSCRBR_STATE_ABRVTN %in% c("XX","ZZ")),]
+
+prescriber_final_new$PRSCRBR_STATE_ABRVTN <- as.character(prescriber_final_new$PRSCRBR_STATE_ABRVTN)
+prescriber_final_new$PRSCRBR_STATE_ABRVTN <- as.factor(prescriber_final_new$PRSCRBR_STATE_ABRVTN)
+
+str(prescriber_final_new$PRSCRBR_STATE_ABRVTN)
+```
+
+```{r}
+#review the number of records in the new data set
+nrow(prescriber_final_new)
+```
+
+We also created a subset of data that only includes opiate drugs to conduct exploratory and descriptive analyses.
+
+```{r}
+#select only basic information and data for opiate drugs
+prescriber_final_slim <- prescriber_final_new[,c("PRSCRBR_STATE_ABRVTN", "PRSCRBR_TYPE", "ACETAMINOPHEN.WITH.CODEINE",  "MORPHINE.SULFATE", "TRAMADOL.HCL","HYDROMORPHONE.HCL", "METHADONE.HCL", "FENTANYL", "OXYCODONE.HCL.ACETAMINOPHEN", "HYDROCODONE.ACETAMINOPHEN", "OXYCODONE.HCL","TOPIRAMATE","OPIOD_PRESC")]
+
+# create another subset that only includes opiate prescriber
+opioid_prescriber <- prescriber_final_slim[prescriber_final_slim$OPIOD_PRESC  == TRUE,]
+
+# create another subset that only includes non-opiate prescriber
+non_opioid_prescriber <- prescriber_final_slim[prescriber_final_slim$OPIOD_PRESC  == FALSE,]
+```
+
+```{r}
+# calculate the proportion of the non-opioid precriber
+nrow(non_opioid_prescriber)/nrow(prescriber_final_slim)
+```
+Around 59% of the prescribers never prescribed opiate drugs before. 
+
+```{r}
+#add new column that summarizes the total opioids prescriptions
+opioid_prescriber$TOTAL_PRESCRIPTIONS <- rowSums(opioid_prescriber[,c(3:12)])
+```
+
+
+```{r}
+#check the statistics of the Total Prescriptions variable
+summary(opioid_prescriber$TOTAL_PRESCRIPTIONS)
+```
+
+Per results above, the distribution of total number of opioid prescriptions written by opioid prescribers is extremely right skewed with a median of 49.0 and mean of 152.6.
+
+We wanted to check the top 10 opioid prescribers by total number of prescriptions.
+
+```{r}
+opioid_prescriber[,c('PRSCRBR_STATE_ABRVTN','PRSCRBR_TYPE','TOTAL_PRESCRIPTIONS')] %>%
+  arrange(-TOTAL_PRESCRIPTIONS) %>%
+  head(10)
+```
+
+As shown above, an individual from LA issued more that 30,000 total number of opioid prescriptions in 2019, which was significantly more than all other prescribers in the entire US.
+
+```{r}
+#Group the prescriber data by Prescriber Type
+groupedByPrescriber <- opioid_prescriber %>% 
+  group_by(PRSCRBR_TYPE) %>% 
+  summarise(Total_Prescriber_Count=n(), Total_Opioids_Count = sum(TOTAL_PRESCRIPTIONS)) %>%
+  arrange(-Total_Opioids_Count)
+
+#check the top prescriber types with highest total prescription amounts
+groupedByPrescriber %>%
+  arrange(-Total_Opioids_Count) %>%
+  head()
+```
+
+The top three prescriber types by total number of opioid prescriptions were Family Practice, Internal Medicine and Nurse Practitioner.
+
+We then checked what were the top three prescriber types by average number of opioid prescriptions. The average was calculated from total number of prescriptions divided by total number of prescribers.
+```{r}
+#create a column for average number of opioids prescription per prescriber
+groupedByPrescriber$Avg_Opioids_Count <- round(groupedByPrescriber$Total_Opioids_Count / groupedByPrescriber$Total_Prescriber_Count)
+
+groupedByPrescriber %>%
+  arrange(-Avg_Opioids_Count) %>%
+  head()
+```
+
+This time, we identified another unusual case. Durable medical equipment & medical supplies specialty had only one opioid prescriber in 2019, but the average number of opioid prescriptions this person wrote ranked the fourth among all specialties. 	 
+
+We created a visualization for top 10 prescriber_types which had the highest number of opioid prescribers.
+
+```{r}
+bp_groupedByPrescriber <- groupedByPrescriber[1:10,] %>%
+  mutate(PRSCRBR_TYPE = fct_reorder(PRSCRBR_TYPE, -Total_Prescriber_Count)) %>%
+  ggplot(aes(x=PRSCRBR_TYPE, y=Total_Prescriber_Count)) +
+  geom_bar(stat="identity", fill="lightblue")+
+  theme_minimal()+
+  ggtitle("Total Number of Opioid Prescribers By Specialty") + 
+  labs(x = "Prescriber Specialty", y = "Prescriber Count")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+bp_groupedByPrescriber
+```
+
+We then reviewed the prescriber and prescription data by State.
+```{r}
+#summarize the total number of prescriptions for each opioid by State
+groupedByState <- aggregate(cbind(ACETAMINOPHEN.WITH.CODEINE,  MORPHINE.SULFATE, TRAMADOL.HCL,HYDROMORPHONE.HCL, METHADONE.HCL, FENTANYL, OXYCODONE.HCL.ACETAMINOPHEN, HYDROCODONE.ACETAMINOPHEN, OXYCODONE.HCL,TOPIRAMATE,TOTAL_PRESCRIPTIONS)~PRSCRBR_STATE_ABRVTN, data = opioid_prescriber, sum)
+
+groupedByState %>%
+  arrange(-TOTAL_PRESCRIPTIONS) %>%
+  head()
+```
+
+The top three States by total number of opioid prescriptions were CA, FL and TX.
+
+
+### Association Rule Mining
+
+**Data Preprocessing**
+
+We first performed the Association Rule Mining analysis. The goal of the Association Rule Mining is to explore relations between Prescriber Type and Drug information, more specifically which opioids are most likely to be prescribed by certain types of medical professionals.  Therefore, we conducted the research using only opioid prescribers and opiate drugs data.
+
+First, we reviewed the opioid prescriber data again.
+```{r}
+summary(opioid_prescriber)
+```
+
+As shown above, all drug variables are numeric and are extremely right skewed (means are far greater than the medians). Therefore, we would like to convert them to factors by discretizing those variables into customized bins.  
+```{r}
+#create a function to discretize drug counts into customized bins
+split_drugcount <- function(name,df){
+df[,name] <-  cut(df[,name], breaks = c(-1,0,10,100,1000,2000,4000,Inf),labels=c("0", "0-10","10-100","100-1000","1000-2000","2000-4000", "Above 4000"))
+return(df)
+}
+
+#create another function to discretize drug counts into different customized bins
+split_drugcount2 <- function(name,df){
+df[,name] <-  cut(df[,name], breaks = c(-1,10,500,1000,2000,4000,Inf),labels=c( "0-10","10-500","500-1000","1000-2000","2000-4000", "Above 4000"))
+return(df)
+}
+
+#create another function to discretize drug counts into different customized bins
+split_drugcount3 <- function(name,df){
+df[,name] <-  cut(df[,name], breaks = c(-1,10,100,500,1000,Inf),labels=c( "0-10","10-100","100-500","500-1000","Above 1000"))
+return(df)
+}
+
+```
+
+We tried using different customized bins, and found out the second one above performed the best results. Therefore, the following analysis will be conducted by applying that discretization function. We also tried to discretize those drug variables into equal-length bins, but found out more meaningful rules could be generated if using customized bins.
+
+```{r}
+#save a copy of the data in a new variable
+opioid_prescriber_arm <- opioid_prescriber
+
+#create the data set that only includes prescriber state, prescriber type and opiate drugs
+opioid_prescriber_arm <- opioid_prescriber_arm[,1:12]
+str(opioid_prescriber_arm)
+```
+
+```{r}
+#perform discretization by applying the function split_drugcount2 to the data
+#the final_opiate_drugs_list variable was created during initial data preprocessing
+for (name in final_opiate_drugs_list) {
+  opioid_prescriber_arm <- split_drugcount2(name,opioid_prescriber_arm)
+}
+
+#review the new data frame
+summary(opioid_prescriber_arm)
+```
+The final data frame only includes information for 401,790 opioid prescribers.
+
+**Data mining**
+Next, we performed association rule mining on the data set using the apriori function in the arules package. We started with generating rules that have a minimum support of 0.10, and a minimum confidence of 0.8.
+```{r}
+a <- Sys.time()
+
+#generate rules using arules package and apriori function
+rules <- apriori(opioid_prescriber_arm, parameter = list(supp = 0.10, conf = 0.80, minlen = 2,maxlen=2))
+
+difftime(Sys.time(),a)
+```
+
+Rules were generated in a second.
+
+```{r}
+# Show the rules that have a lift value greater or equal to a value
+goodrules <- rules[quality(rules)$lift > 1]
+
+# show the rules that have prescriber type on the left hand side
+rules_subset <- subset(goodrules, (lhs %in% paste0("PRSCRBR_TYPE=", unique(opioid_prescriber_arm$PRSCRBR_TYPE))))
+inspect(rules_subset)
+```
+
+As shown above, only three rules that had prescriber type on the left hand side had a lift value greater than 1. Then, we adjusted the support and confidence thresholds to include more rules.
+
+```{r}
+a <- Sys.time()
+
+rules2 <- apriori(opioid_prescriber_arm, parameter = list(supp = 0.03, conf = 0.70, minlen = 2,maxlen=2))
+
+difftime(Sys.time(),a)
+```
+
+```{r}
+# Show the rules that have a lift value greater or equal to 1
+goodrules2 <- rules2[quality(rules2)$lift > 1]
+
+# show the rules that have prescriber type as left hand side
+rules_subset2 <- subset(goodrules2, (lhs %in% paste0("PRSCRBR_TYPE=", unique(opioid_prescriber_arm$PRSCRBR_TYPE))))
+inspect(rules_subset2)
+```
+
+After reviewing the 41 rules generated above, we found 5 most interesting rules and they were put in the final report.
+
+We also did additional research to check if we can find relations between State and Drug information.
+
+```{r}
+a <- Sys.time()
+
+rules3 <- apriori(opioid_prescriber_arm, parameter = list(supp = 0.01, conf = 0.70, minlen = 2,maxlen=2))
+
+difftime(Sys.time(),a)
+```
+
+```{r}
+# Show the rules that have a lift value greater or equal to a value
+goodrules3 <- rules3[quality(rules3)$lift > 1]
+
+# show the rules that have prescriber type as left hand side
+rules_subset3 <- subset(goodrules3, (lhs %in% paste0("PRSCRBR_STATE_ABRVTN=", unique(opioid_prescriber_arm$PRSCRBR_STATE_ABRVTN))))
+inspect(rules_subset3[1:30])
+```
+
+Unfortunately, no interesting rules were generated based on results above. Association rule mining may not be a good technique to analyze relations between State and Drug Name/Prescription Amount.
+
+
+***
+### Clustering Analysis
+```{r}
+## Read the preprocessed data directly
+prescriber_2019 <- read.csv("prescriber_2019.csv")
+```
+
+```{r}
+## Viewing and increasing memory size
+memory.size()             ### Checking your memory size
+memory.limit()            ### Checking the set limit
+memory.limit(size=56000)  ### expanding your memory to 56000 MB (proposed for 64Bit)
+```
+***
+#### Data Prep
+```{r}
+# Filtering to only have prescribers that are in a prescriber type that is the top 20 most common:
+top_20_prescriber_type <- prescriber_2019 %>% count(PRSCRBR_TYPE, sort = TRUE) %>% head(20)
+top_20_prescribers <- c(top_20_prescriber_type$PRSCRBR_TYPE)
+top_20_prescriber_data <- subset(prescriber_2019, subset = PRSCRBR_TYPE %in% top_20_prescribers)
+```
+
+```{r}
+# Sample the dataset for model building 
+sample_5000 <- sample_n(top_20_prescriber_data, 5000)
+
+# Removing unneeded variables for the model
+drop_cols <- c("X","PRSCRBR_NPI", "PRSCRBR_TYPE", "PRSCRBR_STATE_ABRVTN", "OPIOD_PRESC")
+sample_5000 = sample_5000[, !(names(sample_5000) %in% drop_cols)]
+sample_5000_cols = sample_5000[, (names(sample_5000) %in% drop_cols)]
+```
+
+```{r}
+# Information Gain
+info_gain <- information.gain(formula(sample_5000), sample_5000)
+```
+
+```{r}
+## Top 9 Opioids prescribed, and top 9 non-opioids prescribed
+top_drugs <- c("HYDROCODONE.ACETAMINOPHEN",
+  "TRAMADOL.HCL",
+  "OXYCODONE.HCL.ACETAMINOPHEN",
+  "OXYCODONE.HCL",
+  "MORPHINE.SULFATE",
+  "ACETAMINOPHEN.WITH.CODEINE",
+  "FENTANYL",
+  "METHADONE.HCL",
+  "HYDROMORPHONE.HCL",
+  "ATORVASTATIN.CALCIUM",
+  "LEVOTHYROXINE.SODIUM",
+  "AMLODIPINE.BESYLATE",
+  "LISINOPRIL",
+  "GABAPENTIN",
+  "METFORMIN.HCL",
+  "OMEPRAZOLE",
+  "LOSARTAN.POTASSIUM",
+  "FUROSEMIDE")
+
+# Filter out all the drugs that are not in the top 9 opioids, or top 9 non-opioid
+sample_5000 = sample_5000[, (names(sample_5000) %in% top_drugs)]
+```
+
+```{r}
+# Normalizing the data
+sample_data <- data.Normalization(sample_5000, type="n1",normalization="column")
+```
+
+```{r}
+rownames(sample_data) <- NULL
+dist.sample_data <- dist(sample_data)
+```
+
+
+***
+#### Prepping data for statistical tests
+```{r}
+mds1 <- cmdscale(dist.sample_data, k=2)
+
+# Plot to show the outliers that should not be included in building the model
+plot(mds1)
+abline(v=9)
+abline(h=9)
+x.out <- which(mds1[,1]>9)
+y.out <- which(mds1[,2]>9)
+out.all <- c(x.out, y.out)
+out.uni <- unique(out.all)
+d <- sample_data[out.uni,]
+d$x.out <- mds1[out.uni,1]
+d$y.out <- mds1[out.uni,2]
+
+points(d[,19:20], pch=21, bg="red")
+```
+
+```{r}
+full <- 1:5000
+limited <- rownames(d)
+sample_data$mark <- full %in% limited
+describeBy(sample_data[,1:19], sample_data$mark)
+```
+
+```{r}
+sample_data2 <- subset(sample_data, select = -c(mark))
+rm(d)
+```
+
+
+#### Doing a PCA to find what dimentions of the data can explain the greatest amount of variability in the data.
+```{r}
+## Based on this plot and chart, I decide go with 6 top dimensions, since the "cumulative.variance.percent" is over 82%, and each dimension adds at least 3% additional variance explained.
+pca <- PCA(sample_data2, ncp=14, scale.unit = TRUE, graph=FALSE)
+datapca <- data.frame(pca$ind$coord)
+get_eigenvalue(pca)
+
+fviz_eig(pca, ncp = 20, addlabels=TRUE)
+```
+
+
+***
+#### Silhouette Plot
+```{r}
+# Creating a silhouette plot to estimate the optimal number of clusters. Even though it has 2 for the optimal number of clusters, I think the model would make more sense with at least a few more clusters. Therefore, I choose 4 because it still had more information gain than 3 or 5 clusters.
+fviz_nbclust(datapca, FUNcluster = kmeans, method = c("silhouette"), k.max = 12, nboot = 100,)
+```
+
+```{r}
+# Chosen model visual and statistics for the clusters
+kmeanspca4 <- eclust(datapca, "kmeans", hc_metric="euclidean", k=4, graph = T)
+fviz_silhouette(kmeanspca4)
+```
+
+
+***
+#### Model Intepretation
+```{r}
+# Adjusted/summarized the data in Excel to display in Heatmap 
+avg_cluster_values <- read.csv("avg_cluster_values2.csv", fileEncoding="UTF-8-BOM")
+read
+
+# Building heatmap
+heatmap5 <- ggplot(avg_cluster_values, aes(drug, cluster, fill= weight)) +
+  geom_tile(color = "black") +
+  geom_text(aes(label = round(weight,1)), color = "white", size = 4) +
+  scale_color_gradient2(low="blue", mid="white", high="red") +
+  guides(fill = guide_colorbar(barwidth = 0.5, barheight = 10, nbin = 20)) +
+  coord_fixed() +
+  theme(axis.text.x = element_text(size = 8, angle = 75, hjust = 1.1))
+heatmap5
+```
+
+
+### Classification Analysis
+
+Running Classification Analysis on the prescriber dataset will help reveal the most prescribed opioids. Are prescribers favoring a specific Opioid drug? Also, which States and Prescriber types are high-risk?  
+
+**Challenges**: Had some challenges getting a balanced validation set and training set when using Prescriber Type and Prescriber State attributes. The model failed at predicting on the validation set if it had Prescriber Types and State features that were not part of the training process. Therefore, the validation set was filtered so that it consists of only Prescriber Types and States in the training set. Additionally, our support vector machine took too long to train. We ran it for 24 hours and were unable to get it to complete. We then reduced the size of the training data and tried again, and were still unable to get it to complete.
+
+**Data Preparation**
+
+Reading in the data:
+```{r}
+#read the preprocessed data directly
+prescriber <- read.csv(file = "prescriber_2019.csv", sep = ",")
+```
+
+Cleaning up data and preparing it for analysis:
+```{r}
+
+#str(prescriber)
+#length(complete.cases(prescriber))
+
+#cleaning up PRSCBR_TYPE Column
+prescriber$PRSCRBR_TYPE <- c(gsubfn("&|-|/|,","", prescriber$PRSCRBR_TYPE))
+prescriber$PRSCRBR_TYPE <- gsub("[()]", "", prescriber$PRSCRBR_TYPE)
+prescriber$PRSCRBR_TYPE <- gsub(" ", "", prescriber$PRSCRBR_TYPE)
+
+
+#converting OPIOD_PRESC column to factor
+prescriber$OPIOD_PRESC <- as.factor(prescriber$OPIOD_PRESC)
+
+#removing row with PRSCRBR_STATE_ABRVTN = "XX" 
+prescriber <- prescriber %>% filter(PRSCRBR_STATE_ABRVTN != "XX") %>% filter(PRSCRBR_STATE_ABRVTN != "ZZ")
+
+#removing row with no prescriber type
+prescriber <- prescriber %>% filter(PRSCRBR_TYPE != "")
+
+#creating a validation set to test the model - 20% of data for validation
+set.seed(200)
+
+valIndex <- sample(971968, 194393, replace = FALSE)
+trainingSet <- prescriber[-valIndex,]
+validationSet <- prescriber[valIndex,]
+
+
+#creating a balanced validation set to include only States and Prescriber Types that are part of the training set
+validationSet <- validationSet %>% filter(PRSCRBR_STATE_ABRVTN %in% trainingSet$PRSCRBR_STATE_ABRVTN) %>% filter(PRSCRBR_TYPE %in% trainingSet$PRSCRBR_TYPE)
+
+```
+
+**Decision Trees**:
+PRSCRBR_NPI is the unique identifier for each prescriber. Therefore, it is not used for analysis.
+```{r}
+set.seed(200)
+decisionTreeModel <- C5.0(trainingSet[,3:254], trainingSet$OPIOD_PRESC, trials = 6, cost = NULL, control = C5.0Control(noGlobalPruning = FALSE, minCases = 30, CF =0.75))
+decisionTreeModel
+summary(decisionTreeModel)
+```
+Using the model on unseen data (testing for over-fitting):
+```{r}
+treeValidation <- predict(decisionTreeModel, validationSet[,3:254])
+CrossTable(validationSet$OPIOD_PRESC, treeValidation, prop.chisq = FALSE, prop.c = FALSE, prop.r = FALSE, dnn = c('Actual Label', "Predicted Label"))
+```
+
+The C5.0 Algorithm is 100% accurate in predicting Opioid Prescribers. The decision attributes are all opioids: FENTANYL, HYDROCODONE.ACETAMINOPHEN, HYDROMORPHONE.HCL, and METHADONE.HCL. We will consider these the most commonly prescribed opioids and will use them during Clustering Analysis.
+
+
+**Naive Bayes**
+
+The Naive Bayes model produced the conditional probabilities associated with attributes and the target variable, Opioid Prescriber. The Naive Bayes model utilized the Prescriber Type, Prescriber State, and drug attributes to train the model. 
+
+
+Training the model:
+```{r}
+set.seed(200)
+naiveModel <- naive_bayes(trainingSet[,3:254], trainingSet$OPIOD_PRESC, prior = NULL, laplace = 1, usekernel = TRUE, usepoisson = TRUE)
+naiveModel
+```
+
+The a priori probabilities for Opioid Prescriber are as follows: False = 0.587, True = 0.413. When reviewing the conditional probabilities by State, California had the highest conditional probability for Opioid Prescriber = True and Opioid Prescriber = False. California is a large state; this makes sense conceptually. American Samoa had the lowest conditional probability for Opioid Prescriber = True and Opioid Prescriber = False. 
+
+States with relatively high conditional probabilities for Opioid Prescriber = True are Texas, Florida, New York, Pennsylvania, Ohio, Illinois, Michigan, and North Carolina. 
+
+Reviewing conditioning probabilities by Prescriber Type reveals Family Practice had the highest conditional probability for Opioid Prescriber = True. Internal Medicine, Physician Assistant, Orthopedic Surgery, and General Surgery also revealed relatively high conditional probabilities for Opioid Prescriber = True. Dentists had the highest conditional probability for Opioid Prescriber = False and, interestingly, a relatively high conditional probability for Opioid Prescriber = True. 
+
+Validating the model:
+```{r}
+naiveValidate <- predict(naiveModel, validationSet[3:254], type = "class")
+CrossTable(validationSet$OPIOD_PRESC, naiveValidate, prop.r = FALSE, prop.c = FALSE, prop.t = FALSE, prop.chisq = FALSE, dnn = c("Actual Label", "Predicted Label"))
+```
+
+The Naive Bayes model did not perform as well as the Decision Tree model on the validation set and produced an accuracy of 72.8%.
+
+
+**Support Vector Machine**
+Using the data as prepared above, we attempted an SVM model. We used a linear model because we wanted to predict based on two possible outcome,s either True/False for OPIOD_PRESC. We ran into issues with our SVM however as we were not able to get it to complete, even after hours of running.
+```{r}
+#set our search grid
+search_grid = expand.grid(C = seq(0, 2, length = 20))
+
+#set up 3-fold cross validation procedure
+train_control <- trainControl(method = "cv", number = 3)
+
+#build the svm model
+svm1 = train(OPIOD_PRESC ~ ., data = trainingSet, method = "svmLinear", trControl = train_control, tuneGrid = search_grid)
+
+#show the top 3 models
+svm1$results %>% 
+  top_n(3, wt = Accuracy) %>%
+  arrange(desc(Accuracy))
+
+#predict using the validation set
+pred1 <- predict(svm1, newdata = validationSet)
+
+```
+
+Since the above SVM would not complete, we attempted to reduce the size of the training data in order to get it to complete. To do this we sampled 20% of the 70% training data. This still would not complete unfortunately.
+```{r}
+#sample 20% of the train data for another attempt
+smalltrain <- sample_frac(trainingSet, .2)
+str(smalltrain)
+
+#re-build the model with the smaller data
+svm2 = train(OPIOD_PRESC ~ ., data = smalltrain, method = "svmLinear", trControl = train_control, tuneGrid = search_grid)
+
+#show the top 3 models
+svm2$results %>% 
+  top_n(3, wt = Accuracy) %>%
+  arrange(desc(Accuracy))
+
+#predict using the validation set
+pred2 <- predict(svm2, newdata = validationSet)
+```
+
+Ultimately, we were unable to get our SVM to complete, and were therefore unable to use it in out analysis.
+
+### Conclusion
+In conclusion, all models provided crucial and consistent information on the Opioid Prescriber dataset. We found relations between Prescriber Type and Opioid Drug through Association Rule Mining, which can be used to monitor which specialty prescribe certain drugs at specific dosages. Naïve Bayes highlighted high-risk States as well as Prescriber Types. Association Rule Mining and the Decision Tree provided more information on the commonly prescribed opioids. Family Practices, Internal Medicine prescribers, Physician Assistant, Orthopedic Surgeon clinics, and General surgery clinics should be monitored due to high amounts of Opioid prescriptions. Furthermore, access to rehabilitation should be made readily available specifically in high-risk States like Florida, Texas, California, and North Carolina.
